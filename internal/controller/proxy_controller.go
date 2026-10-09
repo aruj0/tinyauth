@@ -398,7 +398,14 @@ func (controller *ProxyController) getForwardAuthContext(c *gin.Context) (ProxyC
 	uri, ok := controller.getHeader(c, "x-forwarded-uri")
 
 	if !ok {
-		return ProxyContext{}, errors.New("x-forwarded-uri not found")
+		// aralab: NPMplus (<= 2026-07-24-r1) sends only x-forwarded-host/proto to
+		// /api/auth/nginx. Keep the pre-v5.1 behaviour of treating a missing uri as "/"
+		// for nginx only, so host-based ACLs keep working. Path ACLs are not usable
+		// in that setup and must not be configured.
+		if c.Param("proxy") != "nginx" {
+			return ProxyContext{}, errors.New("x-forwarded-uri not found")
+		}
+		uri = "/"
 	}
 
 	proto, ok := controller.getHeader(c, "x-forwarded-proto")

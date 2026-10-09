@@ -210,6 +210,54 @@ func TestProxyController(t *testing.T) {
 			},
 		},
 		{
+			description: "aralab: nginx forward auth without x-forwarded-uri (NPMplus) should ask for login",
+			middlewares: []gin.HandlerFunc{},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/nginx", nil)
+				req.Header.Set("x-forwarded-host", "test.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+			},
+		},
+		{
+			description: "aralab: nginx forward auth without x-forwarded-uri (NPMplus) should authenticate",
+			middlewares: []gin.HandlerFunc{
+				simpleCtx,
+			},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/nginx", nil)
+				req.Header.Set("x-forwarded-host", "test.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusOK, recorder.Code)
+				assert.Equal(t, "testuser", recorder.Header().Get("remote-user"))
+			},
+		},
+		{
+			description: "aralab: nginx without x-forwarded-uri must still reject a client-supplied x-original-url",
+			middlewares: []gin.HandlerFunc{},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/nginx", nil)
+				req.Header.Set("x-forwarded-host", "test.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				req.Header.Set("x-original-url", "https://other.example.com/")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			},
+		},
+		{
+			description: "aralab: traefik forward auth without x-forwarded-uri must still fail",
+			middlewares: []gin.HandlerFunc{},
+			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
+				req := httptest.NewRequest("GET", "/api/auth/traefik", nil)
+				req.Header.Set("x-forwarded-host", "test.example.com")
+				req.Header.Set("x-forwarded-proto", "https")
+				router.ServeHTTP(recorder, req)
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			},
+		},
+		{
 			description: "Ensure forward auth fallback for envoy",
 			middlewares: []gin.HandlerFunc{},
 			run: func(t *testing.T, router *gin.Engine, recorder *httptest.ResponseRecorder) {
