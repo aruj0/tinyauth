@@ -19,6 +19,8 @@ type IOAuthService interface {
 	GetAuthURL(state, verifier string) string
 	GetToken(code, verifier string) (*oauth2.Token, error)
 	GetUserinfo(token *oauth2.Token) (*model.Claims, error)
+	IDTokenClaims(token *oauth2.Token) (*IDTokenClaims, error)
+	RefreshToken(refreshToken string) (*oauth2.Token, error)
 	GetConfig() model.OAuthServiceConfig
 	UpdateConfig(config model.OAuthServiceConfig)
 }

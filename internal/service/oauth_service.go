@@ -3,7 +3,12 @@ package service
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/tinyauthapp/tinyauth/internal/model"
@@ -82,7 +87,74 @@ func (s *OAuthService) GetToken(code string, verifier string) (*oauth2.Token, er
 
 func (s *OAuthService) GetUserinfo(token *oauth2.Token) (*model.Claims, error) {
 	client := oauth2.NewClient(s.ctx, oauth2.StaticTokenSource(token))
-	return s.userinfoExtractor(client, s.ctx, s.serviceCfg.UserinfoURL, s.mapClaims)
+	claims, err := s.userinfoExtractor(client, s.ctx, s.serviceCfg.UserinfoURL, s.mapClaims)
+	if err != nil {
+		return nil, err
+	}
+
+	// aralab: Microsoft Entra ID does not return groups from its userinfo endpoint,
+	// only in the ID token. Fall back to the ID token's groups claim when userinfo has none.
+	if claims != nil && claims.Groups == nil {
+		if idClaims, err := s.IDTokenClaims(token); err == nil && idClaims.Groups != nil {
+			claims.Groups = idClaims.Groups
+		}
+	}
+
+	return claims, nil
+}
+
+// aralab: IDTokenClaims holds the ID token claims used for group handling.
+type IDTokenClaims struct {
+	Sub    string
+	Groups any
+}
+
+// IDTokenClaims decodes the id_token returned alongside an OAuth token. The
+// signature is not verified: the token was received directly from the token
+// endpoint over TLS by this server, which OIDC Core 3.1.3.7 allows in place of
+// signature validation. Never call this on a token supplied by a client.
+func (s *OAuthService) IDTokenClaims(token *oauth2.Token) (*IDTokenClaims, error) {
+	if token == nil {
+		return nil, errors.New("no token")
+	}
+
+	raw, ok := token.Extra("id_token").(string)
+	if !ok || raw == "" {
+		return nil, errors.New("no id_token in token response")
+	}
+
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid id_token format: expected 3 parts, got %d", len(parts))
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode id_token payload: %w", err)
+	}
+
+	var kv map[string]any
+	if err := json.Unmarshal(payload, &kv); err != nil {
+		return nil, fmt.Errorf("failed to parse id_token payload: %w", err)
+	}
+
+	if aud, ok := kv["aud"].(string); ok && aud != s.config.ClientID {
+		return nil, fmt.Errorf("id_token audience mismatch")
+	}
+
+	return &IDTokenClaims{
+		Sub:    mapClaim[string]("sub", "", kv),
+		Groups: mapClaim[any]("groups", s.serviceCfg.Claims.Groups, kv),
+	}, nil
+}
+
+// aralab: RefreshToken exchanges a refresh token for a new token set, used to
+// re-read group membership without forcing the user to log in again.
+func (s *OAuthService) RefreshToken(refreshToken string) (*oauth2.Token, error) {
+	if refreshToken == "" {
+		return nil, errors.New("no refresh token provided")
+	}
+	return s.config.TokenSource(s.ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
 }
 
 func (s *OAuthService) GetConfig() model.OAuthServiceConfig {

@@ -160,7 +160,7 @@ func (controller *OAuthController) oauthCallbackHandler(c *gin.Context) {
 	}
 
 	code := c.Query("code")
-	_, err = controller.auth.GetOAuthToken(sessionIdCookie, code)
+	token, err := controller.auth.GetOAuthToken(sessionIdCookie, code)
 
 	if err != nil {
 		controller.log.App.Error().Err(err).Msg("Failed to exchange code for token")
@@ -247,6 +247,9 @@ func (controller *OAuthController) oauthCallbackHandler(c *gin.Context) {
 	}
 
 	http.SetCookie(c.Writer, cookie)
+
+	// aralab: keep the refresh token (memory only) for group refresh on 403
+	controller.auth.StoreOAuthRefreshToken(cookie.Value, svc, token)
 
 	controller.log.AuditLoginSuccess(sessionCookie.Username, sessionCookie.Provider, c.ClientIP())
 

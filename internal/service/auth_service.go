@@ -28,6 +28,11 @@ import (
 const MaxOAuthPendingSessions = 256
 const OAuthCleanupCount = 16
 
+// aralab: limits for the in-memory OAuth refresh token store (group refresh on 403).
+// Refresh tokens are deliberately kept in memory only, never in the session database.
+const MaxOAuthRefreshEntries = 4096
+const OAuthGroupRefreshCooldown = time.Minute
+
 var (
 	ErrUserNotFound = errors.New("user not found")
 )
@@ -49,6 +54,14 @@ type OAuthPendingSession struct {
 	Service        IOAuthService
 	ExpiresAt      time.Time
 	CallbackParams OAuthCallbackParams
+}
+
+// aralab: OAuthRefreshEntry is the refresh token of an OAuth session plus the
+// subject it was issued for and the time of the last refresh attempt.
+type OAuthRefreshEntry struct {
+	RefreshToken string
+	Sub          string
+	LastAttempt  time.Time
 }
 
 type LoginAttempt struct {
@@ -75,6 +88,8 @@ type AuthService struct {
 		login *cache.CacheStore[LoginAttempt]
 		oauth *cache.CacheStore[OAuthPendingSession]
 		ldap  *cache.CacheStore[[]string]
+		// aralab: session uuid -> OAuth refresh token
+		oauthRefresh *cache.CacheStore[OAuthRefreshEntry]
 	}
 }
 
@@ -123,6 +138,7 @@ func NewAuthService(i AuthServiceInput) (*AuthService, error) {
 	service.caches.oauth = oauthCache
 	service.caches.login = loginCache
 	service.caches.ldap = ldapCache
+	service.caches.oauthRefresh = cache.NewCacheStore[OAuthRefreshEntry](MaxOAuthRefreshEntries)
 
 	i.Ding.Go(func(ctx context.Context) {
 		ticker := time.NewTicker(1 * time.Minute)
@@ -134,6 +150,7 @@ func NewAuthService(i AuthServiceInput) (*AuthService, error) {
 				service.caches.oauth.Sweep()
 				service.caches.login.Sweep()
 				service.caches.ldap.Sweep()
+				service.caches.oauthRefresh.Sweep()
 			case <-ctx.Done():
 				return
 			}
@@ -450,6 +467,8 @@ func (auth *AuthService) RefreshSession(ctx context.Context, uuid string) (*http
 }
 
 func (auth *AuthService) DeleteSession(ctx context.Context, uuid string) (*http.Cookie, error) {
+	auth.caches.oauthRefresh.Delete(uuid)
+
 	err := auth.queries.DeleteSession(ctx, uuid)
 
 	if err != nil {
@@ -657,4 +676,111 @@ func (auth *AuthService) getCookieDomain() string {
 		return ""
 	}
 	return auth.runtime.CookieDomain
+}
+
+// aralab: StoreOAuthRefreshToken remembers the refresh token of a freshly created
+// OAuth session so group membership can be re-read later. The subject is taken
+// from the login ID token and must match on every refresh.
+func (auth *AuthService) StoreOAuthRefreshToken(sessionUUID string, service IOAuthService, token *oauth2.Token) {
+	if sessionUUID == "" || token == nil || token.RefreshToken == "" {
+		return
+	}
+
+	claims, err := service.IDTokenClaims(token)
+	if err != nil || claims.Sub == "" {
+		auth.log.App.Debug().Err(err).Msg("No usable id_token subject, not storing refresh token")
+		return
+	}
+
+	auth.caches.oauthRefresh.Set(sessionUUID, OAuthRefreshEntry{
+		RefreshToken: token.RefreshToken,
+		Sub:          claims.Sub,
+	}, time.Duration(auth.config.Auth.SessionExpiry)*time.Second)
+}
+
+// aralab: RefreshOAuthGroups uses the stored refresh token of a session to fetch a
+// new ID token, verifies it belongs to the same subject, and writes the new
+// groups to the session. At most one attempt per session per cooldown period,
+// so a user who really lacks a group does not hit the provider on every request.
+func (auth *AuthService) RefreshOAuthGroups(ctx context.Context, sessionUUID string) ([]string, error) {
+	var entry OAuthRefreshEntry
+	var found, cooling bool
+
+	auth.caches.oauthRefresh.WithLock(func(a cache.CacheStoreActions[OAuthRefreshEntry]) {
+		entry, found = a.Get(sessionUUID)
+		if !found {
+			return
+		}
+		if time.Since(entry.LastAttempt) < OAuthGroupRefreshCooldown {
+			cooling = true
+			return
+		}
+		entry.LastAttempt = time.Now()
+		a.Update(sessionUUID, entry, 0)
+	})
+
+	if !found {
+		return nil, errors.New("no refresh token for session")
+	}
+
+	if cooling {
+		return nil, errors.New("group refresh on cooldown")
+	}
+
+	session, err := auth.GetSession(ctx, sessionUUID)
+	if err != nil {
+		auth.caches.oauthRefresh.Delete(sessionUUID)
+		return nil, fmt.Errorf("failed to get session: %w", err)
+	}
+
+	service, ok := auth.oauthBroker.GetService(session.Provider)
+	if !ok {
+		return nil, fmt.Errorf("oauth service not found: %s", session.Provider)
+	}
+
+	token, err := service.RefreshToken(entry.RefreshToken)
+	if err != nil {
+		// Most failures are permanent (revoked, expired, user disabled); drop the token
+		auth.caches.oauthRefresh.Delete(sessionUUID)
+		return nil, fmt.Errorf("failed to refresh token: %w", err)
+	}
+
+	claims, err := service.IDTokenClaims(token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read refreshed id_token: %w", err)
+	}
+
+	if claims.Sub != entry.Sub {
+		auth.caches.oauthRefresh.Delete(sessionUUID)
+		return nil, errors.New("refreshed id_token subject does not match session")
+	}
+
+	groups := utils.CoalesceToString(claims.Groups)
+
+	if token.RefreshToken != "" {
+		entry.RefreshToken = token.RefreshToken
+	}
+	auth.caches.oauthRefresh.Update(sessionUUID, entry, 0)
+
+	_, err = auth.queries.UpdateSession(ctx, repository.UpdateSessionParams{
+		Username:    session.Username,
+		Email:       session.Email,
+		Name:        session.Name,
+		Provider:    session.Provider,
+		TotpPending: session.TotpPending,
+		OAuthGroups: groups,
+		Expiry:      session.Expiry,
+		OAuthName:   session.OAuthName,
+		OAuthSub:    session.OAuthSub,
+		UUID:        session.UUID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to update session groups: %w", err)
+	}
+
+	if groups == "" {
+		return nil, nil
+	}
+
+	return strings.Split(groups, ","), nil
 }

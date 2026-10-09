@@ -222,6 +222,12 @@ func (controller *ProxyController) proxyHandler(c *gin.Context) {
 
 			if userContext.IsOAuth() {
 				groupOK = controller.policyEngine.Evaluate(service.RuleOAuthGroup, aclsCtx)
+
+				// aralab: the user may have been added to the group after logging in;
+				// re-read groups with the session's refresh token and check again
+				if !groupOK {
+					groupOK = controller.refreshOAuthGroups(c, aclsCtx)
+				}
 			} else {
 				groupOK = controller.policyEngine.Evaluate(service.RuleLDAPGroup, aclsCtx)
 			}
@@ -634,4 +640,25 @@ func (controller *ProxyController) getProxyContext(c *gin.Context) (ProxyContext
 	ctx.IsBrowser = isBrowser
 	ctx.ProxyType = proxy
 	return *ctx, nil
+}
+
+// aralab: refreshOAuthGroups refreshes the OAuth groups of the current session and
+// re-evaluates the OAuth group rule. Returns false on any failure.
+func (controller *ProxyController) refreshOAuthGroups(c *gin.Context, aclsCtx *service.ACLContext) bool {
+	uuid, err := c.Cookie(controller.runtime.SessionCookieName)
+	if err != nil || uuid == "" {
+		return false
+	}
+
+	groups, err := controller.auth.RefreshOAuthGroups(c.Request.Context(), uuid)
+	if err != nil {
+		controller.log.App.Debug().Err(err).Msg("OAuth group refresh not performed")
+		return false
+	}
+
+	aclsCtx.UserContext.OAuth.Groups = groups
+
+	groupOK := controller.policyEngine.Evaluate(service.RuleOAuthGroup, aclsCtx)
+	controller.log.App.Info().Str("user", aclsCtx.UserContext.GetEmail()).Bool("access", groupOK).Msg("Re-checked OAuth groups after token refresh")
+	return groupOK
 }
